@@ -18,6 +18,23 @@ mtop 协议：所有请求需要带上 `sign = md5(token & t & appKey & data)` �
 
 脚本已实现：MD5（内嵌纯 JS）、签名构造、Cookie 管理、token dance、多账号、结果通知。
 
+## 订阅链接（Loon 插件）
+
+Loon 支持用 URL 订阅插件，插件已内置每天 8:30 的定时任务，订阅后可自动拉取脚本更新：
+
+```
+https://raw.githubusercontent.com/noodlespring/loon-taojinbi/main/taobao-taojinbi.plugin
+```
+
+添加方式：Loon → 配置 → 插件 → 添加插件 → 粘贴上面的 URL。
+
+> 脚本直链（不想用插件时，可在 Loon 里按 URL 添加脚本 / 手动下载编辑）：
+> `https://raw.githubusercontent.com/noodlespring/loon-taojinbi/main/taobao_taojinbi.js`
+
+> ⚠️ 通过插件订阅的脚本是远程共享代码，**不包含你的 Cookie**。订阅后请在 Loon 里
+> 打开该脚本（Loon 会把下载的脚本缓存到本地，可编辑），把抓包得到的 Cookie 和
+> API 名填入 `CONFIG` 后再启用定时任务，否则脚本只会提示你补填配置。
+
 ## 使用方法（三步）
 
 ### 第 1 步：抓包拿到 Cookie 和 API 名

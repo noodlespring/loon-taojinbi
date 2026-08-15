@@ -1,0 +1,9 @@
+#!name = 淘金币自动签到
+#!desc = 淘宝淘金币每日自动签到（mtop 接口，仅签到）。订阅后请在 Loon 中编辑下载下来的脚本，把抓包得到的 Cookie 和 API 名填进 CONFIG（步骤见 README）。
+#!author = noodlespring
+#!homePage = https://github.com/noodlespring/loon-taojinbi
+#!system = ios,macos
+#!data = 2026-08-16
+
+[Script]
+cron "30 8 * * *" script-path=https://raw.githubusercontent.com/noodlespring/loon-taojinbi/main/taobao_taojinbi.js, tag=淘金币每日签到, enable=true
