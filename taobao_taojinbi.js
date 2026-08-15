@@ -76,6 +76,23 @@ const CONFIG = {
   notify: true,
   // 通知标题
   notifyTitle: '淘金币签到',
+
+  // 【推荐】使用 taobao_cookie.js 自动抓取并存到 $persistentStore 的 Cookie
+  // 为 true 时优先用 store 里的 Cookie（自动抓的），未抓到才用下方 accounts
+  useStoredCookie: true,
+  // store 里 Cookie 的 key（与 taobao_cookie.js 保持一致）
+  storeCookieKey: 'taojinbi_cookie',
+  // store 里上次抓到的 API 名（供你回填 apiName 用，只是参考）
+  storeApiKey: 'taojinbi_api_name',
+
+  // 【可选】查询金币余额的接口名（抓包得到后填上；不填则尝试从签到响应里提取）
+  balanceApi: '',
+
+  // 【可选】额外赚金币任务表
+  // 每个任务：{ name: 任务名, api: 接口名, params: 请求体 data 对象 }
+  // 逛店铺 / 看视频等需要真实 UI 操作的任务纯接口做不了；
+  // 你抓包到「可一键领取/上报」的任务接口后填进来，脚本会逐个执行
+  extraTasks: [],
 };
 
 // ============================================================
@@ -449,28 +466,91 @@ function extractCoinInfo(parsed) {
   return info;
 }
 
-// 签到单个账号，返回结果描述字符串
+// 从提取到的字段里挑一个最像「当前金币余额」的值，用于通知
+function pickCoinBalance(info) {
+  if (!info) return '';
+  const priority = ['balance', 'coinSum', 'coinTotal', 'totalCoin', 'coin', 'total', 'count'];
+  for (const key of priority) {
+    if (info[key] !== undefined && /^\-?\d+(\.\d+)?$/.test(info[key])) return info[key];
+  }
+  // 兜底：取第一个数字字段
+  for (const key of Object.keys(info)) {
+    if (/^\-?\d+(\.\d+)?$/.test(info[key])) return info[key];
+  }
+  return '';
+}
+
+// 调用单个 mtop 接口并返回 { name, ret, success, coinText, raw }
+async function callApi(httpImpl, session, name, api, params) {
+  const { parsed } = await mtopCall(httpImpl, session, api, params);
+  if (!parsed) return { name, success: false, ret: '响应解析失败（可能被风控拦截）' };
+  const ret = getRet(parsed);
+  const info = extractCoinInfo(parsed);
+  return {
+    name,
+    success: isSuccess(parsed),
+    ret,
+    info,
+    parsed,
+    coinText: Object.keys(info).length
+      ? Object.keys(info).map((k) => k + '=' + info[k]).join(', ')
+      : '',
+  };
+}
+
+// 可选：单独查询金币余额
+async function queryBalance(httpImpl, session, cfg) {
+  if (!cfg.balanceApi) return '';
+  const { parsed } = await mtopCall(httpImpl, session, cfg.balanceApi, {});
+  const info = extractCoinInfo(parsed);
+  return pickCoinBalance(info);
+}
+
+// 执行额外任务表，返回描述数组
+async function runExtraTasks(httpImpl, session, cfg) {
+  const lines = [];
+  if (!cfg.extraTasks || cfg.extraTasks.length === 0) return lines;
+  for (const task of cfg.extraTasks) {
+    if (!task.api || /PLEASE_FILL/i.test(task.api)) continue;
+    try {
+      const r = await callApi(httpImpl, session, task.name, task.api, task.params || {});
+      if (r.success) lines.push(task.name + '：完成' + (r.coinText ? '（' + r.coinText + '）' : ''));
+      else if (/已领取|已做过|今日已|重复/i.test(r.ret)) lines.push(task.name + '：已完成过');
+      else lines.push(task.name + '：失败（' + r.ret + '）');
+    } catch (e) {
+      lines.push(task.name + '：异常（' + (e && e.message ? e.message : String(e)) + '）');
+    }
+  }
+  return lines;
+}
+
+// 签到单个账号，返回结果描述字符串（含金币数量，用于通知）
 async function signInAccount(httpImpl, account, cfg) {
   const session = createSession(account.cookie, cfg);
-  const { parsed } = await mtopCall(httpImpl, session, cfg.apiName, cfg.requestParams);
+  const signResult = await callApi(httpImpl, session, account.name + '签到', cfg.apiName, cfg.requestParams);
 
-  if (!parsed) return account.name + '：响应解析失败（可能被风控拦截，需打开抓包看真实返回）';
+  // 签到后查询一次当前金币余额（优先用余额接口，没有则用签到响应里的字段）
+  let balance = '';
+  try { balance = await queryBalance(httpImpl, session, cfg); } catch (e) { balance = ''; }
+  if (!balance) balance = pickCoinBalance(signResult.info);
 
-  const ret = getRet(parsed);
-  if (isSuccess(parsed)) {
-    const info = extractCoinInfo(parsed);
-    const coinText = Object.keys(info).length
-      ? '（' + Object.keys(info).map((k) => k + '=' + info[k]).join(', ') + '）'
-      : '';
-    return account.name + '：签到成功' + coinText;
+  const accountLabel = account.name || '账号';
+  let line;
+  if (signResult.success) {
+    line = accountLabel + '：签到成功' + (balance ? '，当前金币 ' + balance : '');
+  } else if (/签到|已领取|今日已/i.test(signResult.ret)) {
+    line = accountLabel + '：已签到' + (balance ? '，当前金币 ' + balance : '') + '（' + signResult.ret + '）';
+  } else if (isRiskControl(signResult.parsed || {})) {
+    line = accountLabel + '：触发风控验证，需手动处理（' + signResult.ret + '）';
+  } else {
+    line = accountLabel + '：失败（' + signResult.ret + '）';
   }
-  if (/签到|已领取|今日已/i.test(ret)) {
-    return account.name + '：已签到/已领取（' + ret + '）';
-  }
-  if (isRiskControl(parsed)) {
-    return account.name + '：触发风控验证，需手动处理（' + ret + '）';
-  }
-  return account.name + '：失败（' + ret + '）';
+
+  // 附加额外任务结果
+  const taskLines = await runExtraTasks(httpImpl, session, cfg);
+  if (taskLines.length) line += '\n' + taskLines.join('\n');
+
+  return line;
 }
 
 // ============================================================
@@ -488,28 +568,49 @@ function log(msg) {
   else if (typeof $log !== 'undefined') $log(msg);
 }
 
+// 汇总账号列表：优先 store 里自动抓取的 Cookie，其次手动配置的 accounts
+function resolveAccounts(cfg) {
+  const accounts = [];
+  if (cfg.useStoredCookie && typeof $persistentStore !== 'undefined') {
+    const stored = $persistentStore.read(cfg.storeCookieKey);
+    if (stored && !/PLEASE_FILL/i.test(stored)) {
+      accounts.push({ name: '抓包账号', cookie: stored, fromStore: true });
+    }
+  }
+  const manual = (cfg.accounts || []).filter(
+    (a) => a.cookie && !/PLEASE_FILL/i.test(a.cookie)
+  );
+  // 如果 store 账号的 cookie 和手动第一个相同，避免重复签到
+  if (accounts.length === 0 || manual.length === 0 || accounts[0].cookie !== manual[0].cookie) {
+    accounts.push(...manual);
+  }
+  return accounts;
+}
+
 async function main() {
   // 配置预检
   if (!CONFIG.apiName || /PLEASE_FILL/i.test(CONFIG.apiName)) {
-    notify(CONFIG.notifyTitle, '请先填写 API 名称：在脚本 CONFIG.apiName 处回填抓包得到的接口名（见 README）');
+    const hint = (typeof $persistentStore !== 'undefined' && $persistentStore.read(CONFIG.storeApiKey))
+      ? '（上次抓包捕获到接口：' + $persistentStore.read(CONFIG.storeApiKey) + '，可填入 CONFIG.apiName）'
+      : '（用 Loon 抓包 h5api.m.taobao.com 拿到签到接口名，见 README）';
+    notify(CONFIG.notifyTitle, '请先填写 API 名称：在 CONFIG.apiName 处回填' + hint);
     return;
   }
-  const filled = CONFIG.accounts.filter(
-    (a) => a.cookie && !/PLEASE_FILL/i.test(a.cookie)
-  );
-  if (filled.length === 0) {
-    notify(CONFIG.notifyTitle, '请先填写账号 Cookie：在脚本 CONFIG.accounts 处回填（见 README）');
+
+  const accounts = resolveAccounts(CONFIG);
+  if (accounts.length === 0) {
+    notify(CONFIG.notifyTitle, '未找到 Cookie：先用 taobao_cookie.js 抓一次，或在 CONFIG.accounts 手动填写（见 README）');
     return;
   }
 
   const lines = [];
-  for (const account of filled) {
+  for (const account of accounts) {
     try {
       const line = await signInAccount(http, account, CONFIG);
       lines.push(line);
       log(line);
     } catch (e) {
-      const errLine = account.name + '：请求异常（' + (e && e.message ? e.message : String(e)) + '）';
+      const errLine = (account.name || '账号') + '：请求异常（' + (e && e.message ? e.message : String(e)) + '）';
       lines.push(errLine);
       log(errLine);
     }
@@ -542,6 +643,12 @@ if (typeof $httpClient !== 'undefined') {
     extractToken,
     createSession,
     mtopCall,
+    callApi,
+    runExtraTasks,
+    queryBalance,
+    pickCoinBalance,
+    extractCoinInfo,
+    resolveAccounts,
     signInAccount,
     CONFIG,
   };

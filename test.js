@@ -14,7 +14,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 const m = require('./taobao_taojinbi.js');
 
-const { md5, mtopSign, buildFormBody, parseCookieHeader, parseCookieString, cookieJarToString, extractToken, createSession, mtopCall, signInAccount } = m;
+const { md5, mtopSign, buildFormBody, parseCookieHeader, parseCookieString, cookieJarToString, extractToken, createSession, mtopCall, callApi, runExtraTasks, queryBalance, pickCoinBalance, extractCoinInfo, resolveAccounts, signInAccount } = m;
 
 let passed = 0;
 let failed = 0;
@@ -150,6 +150,105 @@ test('signInAccount 已签到返回友好描述', async () => {
   const cfg = { apiName: 'mtop.test.api', requestParams: {}, appKey: '12574478', tInMilliseconds: true, apiVersion: '1.0', type: 'originaljson', dataType: 'json', jsv: '2.4.8', headers: {} };
   const line = await signInAccount(mock, { name: '账号1', cookie: 'unb=u1' }, cfg);
   assert.ok(/已签到/.test(line), 'got: ' + line);
+});
+
+console.log('== 5. 金币数量提取与通知 ==');
+test('extractCoinInfo 提取余额字段', () => {
+  const info = extractCoinInfo({ ret: ['SUCCESS'], data: { coinSum: 100, balance: 8888, foo: 'bar' } });
+  assert.strictEqual(info['balance'], '8888');
+});
+test('pickCoinBalance 优先级取余额', () => {
+  assert.strictEqual(pickCoinBalance({ coinTotal: '30', balance: '12345' }), '12345');
+  assert.strictEqual(pickCoinBalance({ coin: '15' }), '15');
+  assert.strictEqual(pickCoinBalance({}), '');
+});
+test('signInAccount 成功时带当前金币数', async () => {
+  const mock = makeMockHttp([
+    { status: 200, headers: { 'set-cookie': '_m_h5_tk=tk_1; path=/' }, body: JSON.stringify({ ret: ['FAIL_SYS_TOKEN_EMPTY::令牌为空'], data: {} }) },
+    { status: 200, body: JSON.stringify({ ret: ['SUCCESS::调用成功'], data: { balance: 6666 } }) },
+  ]);
+  const cfg = { apiName: 'mtop.test.api', requestParams: {}, appKey: '12574478', tInMilliseconds: true, apiVersion: '1.0', type: 'originaljson', dataType: 'json', jsv: '2.4.8', headers: {}, balanceApi: '' };
+  const line = await signInAccount(mock, { name: '账号1', cookie: 'unb=u1' }, cfg);
+  assert.ok(line.includes('当前金币 6666'), 'got: ' + line);
+});
+
+console.log('== 6. 额外任务表 ==');
+test('runExtraTasks 执行任务表并汇总结果', async () => {
+  const responses = [
+    { status: 200, headers: { 'set-cookie': '_m_h5_tk=tk_1; path=/' }, body: JSON.stringify({ ret: ['FAIL_SYS_TOKEN_EMPTY::令牌为空'], data: {} }) },
+    { status: 200, body: JSON.stringify({ ret: ['SUCCESS::调用成功'], data: { coin: 5 } }) },
+    { status: 200, body: JSON.stringify({ ret: ['FAIL_SYS_ALREADY_DONE::今日已做过'], data: {} }) },
+  ];
+  const mock = makeMockHttp(responses);
+  const session = createSession('unb=u1', { appKey: '12574478' });
+  const cfg = {
+    extraTasks: [
+      { name: '逛逛赚', api: 'mtop.aaa', params: {} },
+      { name: '翻牌', api: 'mtop.bbb', params: {} },
+    ],
+  };
+  const lines = await runExtraTasks(mock, session, cfg);
+  assert.strictEqual(lines.length, 2);
+  assert.ok(lines[0].includes('逛逛赚：完成'), 'got: ' + lines.join('|'));
+  assert.ok(lines[1].includes('翻牌：已完成过'), 'got: ' + lines.join('|'));
+});
+test('runExtraTasks 忽略未填写的任务', async () => {
+  const mock = makeMockHttp([]);
+  const session = createSession('unb=u1', { appKey: '12574478' });
+  const lines = await runExtraTasks(mock, session, { extraTasks: [{ name: '空接口', api: 'PLEASE_FILL_API_NAME' }] });
+  assert.strictEqual(lines.length, 0);
+});
+
+console.log('== 7. 账号解析（store 优先） ==');
+test('resolveAccounts store 优先，手动不同账号合并且不重复', () => {
+  const prev = global.$persistentStore;
+  global.$persistentStore = { read: (k) => (k === 'taojinbi_cookie' ? 'unb=storecookie' : '') };
+  const cfg = {
+    useStoredCookie: true, storeCookieKey: 'taojinbi_cookie', storeApiKey: 'taojinbi_api_name',
+    accounts: [{ name: '手动', cookie: 'unb=manual' }],
+  };
+  const accounts = resolveAccounts(cfg);
+  global.$persistentStore = prev;
+  assert.strictEqual(accounts.length, 2);
+  assert.ok(accounts[0].fromStore, 'store 账号排在最前');
+  assert.strictEqual(accounts[0].cookie, 'unb=storecookie');
+  assert.strictEqual(accounts[1].cookie, 'unb=manual');
+});
+test('resolveAccounts store 与手动相同账号时不重复', () => {
+  const prev = global.$persistentStore;
+  global.$persistentStore = { read: (k) => (k === 'taojinbi_cookie' ? 'unb=same' : '') };
+  const cfg = {
+    useStoredCookie: true, storeCookieKey: 'taojinbi_cookie', storeApiKey: 'taojinbi_api_name',
+    accounts: [{ name: '手动', cookie: 'unb=same' }],
+  };
+  const accounts = resolveAccounts(cfg);
+  global.$persistentStore = prev;
+  assert.strictEqual(accounts.length, 1);
+  assert.strictEqual(accounts[0].cookie, 'unb=same');
+});
+test('resolveAccounts store 为空时回退手动账号', () => {
+  const prev = global.$persistentStore;
+  global.$persistentStore = { read: () => '' };
+  const cfg = {
+    useStoredCookie: true, storeCookieKey: 'taojinbi_cookie', storeApiKey: 'taojinbi_api_name',
+    accounts: [{ name: '手动', cookie: 'unb=manual' }],
+  };
+  const accounts = resolveAccounts(cfg);
+  global.$persistentStore = prev;
+  assert.strictEqual(accounts.length, 1);
+  assert.strictEqual(accounts[0].cookie, 'unb=manual');
+});
+test('resolveAccounts 无 store 环境回退手动账号', () => {
+  const prev = global.$persistentStore;
+  delete global.$persistentStore;
+  const cfg = {
+    useStoredCookie: true, storeCookieKey: 'k', storeApiKey: 'k2',
+    accounts: [{ name: '手动', cookie: 'unb=manual' }],
+  };
+  const accounts = resolveAccounts(cfg);
+  if (prev) global.$persistentStore = prev;
+  assert.strictEqual(accounts.length, 1);
+  assert.strictEqual(accounts[0].cookie, 'unb=manual');
 });
 
 console.log();
